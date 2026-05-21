@@ -1,0 +1,21 @@
+services:
+  myxiaoai:
+    build: .
+    container_name: myxiaoai-agent
+    ports:
+      - "8000:8000"
+    environment:
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
+      - MI_USER=${MI_USER}
+      - MI_PASS=${MI_PASS}
+      - MYXIAOAI_LLM__MODEL=${LLM_MODEL:-deepseek-chat}
+      - MYXIAOAI_LLM__API_KEY=${DEEPSEEK_API_KEY}
+      - MYXIAOAI_LLM__BASE_URL=${LLM_BASE_URL:-https://api.deepseek.com}
+      - MYXIAOAI_XIAOMI__USERNAME=${MI_USER}
+      - MYXIAOAI_XIAOMI__PASSWORD=${MI_PASS}
+      - MYXIAOAI_XIAOMI__HARDWARE=${HARDWARE:-L05C}
+      - MYXIAOAI_XIAOMI__USE_COMMAND=true
+      - MYXIAOAI_XIAOMI__MUTE_XIAOAI=true
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    restart: unless-stopped
