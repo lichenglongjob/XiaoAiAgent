@@ -1,12 +1,20 @@
 import asyncio
+import json
+import time
 from typing import Any
 
-from aiohttp import ClientSession
+from aiohttp import ClientSession, ClientTimeout
 
 from src.agent import Agent, convert_openai_messages
 from src.config import AppConfig
 
 from .miservice import MiAccount, MiIOService, MiNAService
+
+
+LATEST_ASK_API = (
+    "https://userprofile.mina.mi.com/device_profile/v2/conversation"
+    "?source=dialogu&hardware={hardware}&timestamp={timestamp}&limit=2"
+)
 
 
 class XiaoAiSpeakerClient:
@@ -24,8 +32,13 @@ class XiaoAiSpeakerClient:
         self.mina: MiNAService | None = None
         self.miio: MiIOService | None = None
         self.device: dict[str, Any] | None = None
+        self.device_id: str = ""
+        self.mi_did: str = ""
 
         self._last_query: str = ""
+        self._seen_request_ids: set[str] = set()
+        self._history_primed = False
+        self._poll_count = 0
         self._session: ClientSession | None = None
         self._running = False
 
@@ -53,7 +66,8 @@ class XiaoAiSpeakerClient:
         target_id = self.xiaomi_cfg.did
         if target_id:
             for dev in devices:
-                if dev.get("deviceID") == target_id or dev.get("did") == target_id:
+                ids = (dev.get("deviceID"), dev.get("did"), dev.get("miotDID"))
+                if target_id in ids:
                     self.device = dev
                     break
             if self.device is None:
@@ -66,50 +80,96 @@ class XiaoAiSpeakerClient:
             if self.device is None:
                 self.device = devices[0]
 
-        print(f"[XiaoAi] 已连接设备: {self.device.get('name')} "
-              f"({self.device.get('model')}) deviceID={self.device.get('deviceID')}")
+        self.device_id = str(self.device.get("deviceID") or "")
+        self.mi_did = await self._resolve_mi_did(devices)
 
-    async def run(self) -> None:
+        print(f"[XiaoAi] 已连接设备: {self.device.get('name')} "
+              f"({self.device.get('model')}) deviceID={self.device_id} miotDID={self.mi_did or '未知'}")
+        print(
+            "[XiaoAi] 监听配置: "
+            f"hardware={self.xiaomi_cfg.hardware}, use_command={self.xiaomi_cfg.use_command}, "
+            f"mute_xiaoai={self.xiaomi_cfg.mute_xiaoai}, "
+            f"trigger_word={self.xiaomi_cfg.trigger_word or '空'}, "
+            f"polling_interval={self.xiaomi_cfg.polling_interval}s, "
+            f"debug={self.xiaomi_cfg.debug}"
+        )
+        if self.xiaomi_cfg.use_command and not self.mi_did:
+            print("[XiaoAi] 警告: 未找到 miotDID，L05C 的 TTS/MIOT 命令可能无法发送")
+        await self._prime_history()
+
+    async def _resolve_mi_did(self, mina_devices: list[dict[str, Any]]) -> str:
+        """查找 MIOT 命令需要使用的数字 did。"""
+        if self.device is None:
+            return ""
+
+        target_id = (self.xiaomi_cfg.did or "").strip()
+        if target_id.isdigit():
+            return target_id
+
+        for key in ("miotDID", "miotDid", "did"):
+            value = self.device.get(key)
+            if value:
+                return str(value)
+
+        if self.miio is None:
+            return ""
+
+        try:
+            miio_devices = await self.miio.device_list("full")
+        except Exception as exc:
+            self._debug(f"读取 MIOT 设备列表失败: {type(exc).__name__}: {exc}")
+            return ""
+
+        model = self.device.get("model")
+        name = self.device.get("name")
+        for dev in miio_devices:
+            if model and dev.get("model") == model:
+                return str(dev.get("did") or "")
+            if name and dev.get("name") == name:
+                return str(dev.get("did") or "")
+        return ""
+
+    async def run(self, initialized: bool = False) -> None:
         """主轮询循环。"""
-        await self.init()
+        if not initialized:
+            await self.init()
         self._running = True
         print("[XiaoAi] 开始监听音箱消息...")
 
-        while self._running:
-            try:
-                await self._poll_once()
-            except Exception as exc:
-                print(f"[XiaoAi] 轮询异常: {exc}")
-            await asyncio.sleep(self.xiaomi_cfg.polling_interval)
+        try:
+            while self._running:
+                try:
+                    await self._poll_once()
+                except Exception as exc:
+                    print(f"[XiaoAi] 轮询异常: {type(exc).__name__}: {exc}")
+                await asyncio.sleep(self.xiaomi_cfg.polling_interval)
+        finally:
+            await self.close()
 
     async def _poll_once(self) -> None:
-        """单次轮询：查询播放状态，检测新消息。"""
+        """单次轮询：查询最近对话，检测新用户消息。"""
         if self.device is None:
             return
 
-        device_id = self.device["deviceID"]
-
-        if self.xiaomi_cfg.use_command:
-            # L05C/L05B 模式：通过 miio_command 查询
-            result = await self._miio_player_get_status(device_id)
-        else:
-            # LX06 等支持 ubus 的模式
-            result = await self._ubus_player_get_status(device_id)
-
-        if not result:
+        record = await self._get_latest_ask()
+        if not record:
             return
 
-        current_text = self._extract_text(result)
+        current_text = str(record.get("query") or "").strip()
         if not current_text:
+            self._debug(f"最近对话没有 query 字段: {self._compact(record)}")
             return
 
         # 忽略重复消息和空消息
         if current_text == self._last_query:
+            self._debug(f"跳过重复输入: {current_text}")
             return
         self._last_query = current_text
 
         # 过滤掉系统提示、音乐播放等非用户输入内容
-        if self._should_ignore(current_text):
+        ignore_reason = self._should_ignore(current_text)
+        if ignore_reason:
+            print(f"[XiaoAi] 忽略消息({ignore_reason}): {current_text}")
             return
 
         # 触发词检查：如果配置了 trigger_word，只有包含触发词才走 Agent
@@ -125,19 +185,135 @@ class XiaoAiSpeakerClient:
                 query_text = current_text
 
         print(f"[XiaoAi] 检测到用户输入: {current_text}")
+        self._debug(f"对话记录: {self._compact(record)}")
+
+        if self.xiaomi_cfg.mute_xiaoai:
+            await self._stop_playing(self.device_id)
 
         # 调用 Agent
         response = await self._chat(query_text)
         print(f"[XiaoAi] Agent 回复: {response}")
 
         # 发送 TTS
-        if self.xiaomi_cfg.mute_xiaoai:
-            # 先发送 stop 命令停止小爱原生回复
-            await self._stop_playing(device_id)
-
-        await self._speak(device_id, response)
+        await self._speak(self.device_id, response)
 
     # ---------- 通信方法 ----------
+
+    async def _prime_history(self) -> None:
+        """启动时标记已有对话，避免重放历史问题。"""
+        records = await self._fetch_conversation_records()
+        if records is None:
+            return
+        for record in records:
+            self._seen_request_ids.add(self._record_id(record))
+        self._history_primed = True
+        self._debug(f"已标记 {len(records)} 条历史对话，等待新的用户输入")
+
+    async def _get_latest_ask(self) -> dict[str, Any] | None:
+        """从小米对话记录接口读取最近一次用户提问。"""
+        records = await self._fetch_conversation_records()
+        if records is None:
+            return None
+
+        if not self._history_primed:
+            for record in records:
+                self._seen_request_ids.add(self._record_id(record))
+            self._history_primed = True
+            self._debug(f"首次轮询已标记 {len(records)} 条历史对话")
+            return None
+
+        unseen = [
+            record
+            for record in records
+            if self._record_id(record) not in self._seen_request_ids
+        ]
+        if not unseen:
+            if self.xiaomi_cfg.debug and self._poll_count % 10 == 0:
+                self._debug(f"暂无新的用户输入，最近记录: {self._compact(records[:2])}")
+            return None
+
+        unseen.sort(key=lambda item: int(item.get("time") or 0))
+        record = unseen[0]
+        self._seen_request_ids.add(self._record_id(record))
+        return record
+
+    async def _fetch_conversation_records(self) -> list[dict[str, Any]] | None:
+        """读取并解析小米最近对话记录。"""
+        if not self.account or not self.account.token:
+            return None
+
+        token = self.account.token
+        mico_token = token.get("micoapi")
+        if not self.device_id or not mico_token:
+            self._debug("缺少 deviceID 或 micoapi token，无法读取对话记录")
+            return None
+
+        self._poll_count += 1
+        timestamp = int(time.time() * 1000)
+        url = LATEST_ASK_API.format(
+            hardware=self.xiaomi_cfg.hardware,
+            timestamp=timestamp,
+        )
+        cookies = {
+            "deviceId": self.device_id,
+            "serviceToken": mico_token[1],
+            "userId": token.get("userId", ""),
+        }
+        headers = {
+            "User-Agent": (
+                "MiHome/6.0.103 (com.xiaomi.mihome; build:6.0.103.1; "
+                "iOS 14.4.0) MICO/iOSApp/appStore/6.0.103"
+            )
+        }
+
+        session = await self._ensure_session()
+        try:
+            async with session.get(
+                url,
+                cookies=cookies,
+                headers=headers,
+                timeout=ClientTimeout(total=15),
+            ) as resp:
+                raw = await resp.text()
+                if resp.status != 200:
+                    print(f"[XiaoAi] 读取对话记录失败: HTTP {resp.status} {raw[:200]}")
+                    return None
+        except Exception as exc:
+            print(f"[XiaoAi] 读取对话记录异常: {type(exc).__name__}: {exc}")
+            return None
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            print(f"[XiaoAi] 对话记录响应不是 JSON: {raw[:200]}")
+            return None
+
+        records = self._extract_records(data)
+        if records is None and self.xiaomi_cfg.debug and self._poll_count % 10 == 0:
+            self._debug(f"对话记录响应格式异常: {self._compact(data)}")
+        return records
+
+    def _extract_records(self, data: dict[str, Any]) -> list[dict[str, Any]] | None:
+        payload = data.get("data", data)
+        if isinstance(payload, str):
+            try:
+                payload = json.loads(payload)
+            except json.JSONDecodeError:
+                self._debug(f"data 字段不是 JSON: {payload[:200]}")
+                return None
+
+        if not isinstance(payload, dict):
+            return None
+
+        records = payload.get("records") or []
+        return [record for record in records if isinstance(record, dict)]
+
+    @staticmethod
+    def _record_id(record: dict[str, Any]) -> str:
+        request_id = str(record.get("requestId") or "").strip()
+        if request_id:
+            return request_id
+        return f"{record.get('time', '')}:{record.get('query', '')}"
 
     async def _ubus_player_get_status(self, device_id: str) -> dict[str, Any] | None:
         """通过 MiNAService ubus 查询播放状态（LX06 等支持）。"""
@@ -155,22 +331,26 @@ class XiaoAiSpeakerClient:
             )
             if result and result.get('code') == 0:
                 return result.get('data')
-        except Exception:
-            pass
+        except Exception as exc:
+            self._debug(f"ubus 播放状态查询失败: {type(exc).__name__}: {exc}")
         return None
 
     async def _miio_player_get_status(self, device_id: str) -> dict[str, Any] | None:
         """通过 MiIOService 查询播放状态（L05C 用 miio_command 方式）。"""
         if self.miio is None:
             return None
+        if not self.mi_did:
+            self._debug("缺少 miotDID，跳过 MIOT 播放状态查询")
+            return None
         try:
             result = await self.miio.home_request(
-                self.device["did"],
+                self.mi_did,
                 'player_get_play_status',
                 {"status": -1, "play_song_detail": 1}
             )
             return result if isinstance(result, dict) else None
-        except Exception:
+        except Exception as exc:
+            self._debug(f"MIOT 播放状态查询失败: {type(exc).__name__}: {exc}")
             return None
 
     async def _speak(self, device_id: str, text: str) -> bool:
@@ -179,17 +359,18 @@ class XiaoAiSpeakerClient:
             return False
         try:
             if self.xiaomi_cfg.use_command:
-                # L05C: 使用 miio_command 发送 TTS
-                # 命令格式: [siid, aiid, text]
-                cmd = self.xiaomi_cfg.tts_command + [text]
-                await self.miio.home_request(
-                    self.device["did"],
-                    'play_specify_media',
-                    cmd
-                )
+                if self.miio is None or not self.mi_did:
+                    print("[XiaoAi] TTS 发送失败: 缺少 MIOT 服务或 miotDID")
+                    return False
+                cmd = tuple(self.xiaomi_cfg.tts_command)
+                code = await self.miio.miot_action(self.mi_did, cmd, [text])
+                if code != 0:
+                    print(f"[XiaoAi] TTS 发送失败: MIOT action 返回 code={code}")
+                    return False
             else:
                 # LX06: 直接 text_to_speech
                 await self.mina.text_to_speech(device_id, text)
+            print("[XiaoAi] TTS 已发送")
             return True
         except Exception as exc:
             print(f"[XiaoAi] TTS 发送失败: {exc}")
@@ -200,11 +381,13 @@ class XiaoAiSpeakerClient:
         if self.mina is None:
             return False
         try:
-            await self.mina.ubus_request(
+            ok = await self.mina.ubus_request(
                 device_id, 'player_play_operation', 'mediaplayer', {'action': 'stop'}
             )
-            return True
-        except Exception:
+            self._debug(f"发送 stop 命令结果: {ok}")
+            return bool(ok)
+        except Exception as exc:
+            self._debug(f"发送 stop 命令失败: {type(exc).__name__}: {exc}")
             return False
 
     # ---------- Agent 调用 ----------
@@ -230,12 +413,14 @@ class XiaoAiSpeakerClient:
                 return info.get("title", "") or info.get("text", "") or ""
         return ""
 
-    @staticmethod
-    def _should_ignore(text: str) -> bool:
+    def _should_ignore(self, text: str) -> str | None:
         """判断文本是否为系统消息或非用户输入，需要忽略。"""
+        normalized = text.replace("，", "").replace(",", "").strip()
+        if normalized in {"小爱", "小爱同学"}:
+            return "唤醒词"
+
         ignore_patterns = [
             "正在为您",
-            "小爱",
             "请稍等",
             "马上",
             "播放",
@@ -244,8 +429,19 @@ class XiaoAiSpeakerClient:
         ]
         for pattern in ignore_patterns:
             if pattern in text:
-                return True
-        return len(text) < 2  # 忽略太短的文本
+                return pattern
+        if len(text) < 2:
+            return "文本过短"
+        return None
+
+    def _debug(self, message: str) -> None:
+        if self.xiaomi_cfg.debug:
+            print(f"[XiaoAi][debug] {message}")
+
+    @staticmethod
+    def _compact(value: Any, limit: int = 800) -> str:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+        return text if len(text) <= limit else text[:limit] + "..."
 
     async def close(self) -> None:
         self._running = False

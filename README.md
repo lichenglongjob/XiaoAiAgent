@@ -7,7 +7,7 @@
 ```
 小爱音箱 Play 增强版 (L05C)
     ↓ 语音交互
-XiaoAiSpeakerClient（内置 miservice，轮询监听）
+XiaoAiSpeakerClient（内置 miservice，轮询小米对话记录）
     ↓ 检测到用户语音
 LangGraph Agent（DeepSeek / 可切换）
     ├─ 本地 Tools（Python 函数注册）
@@ -161,6 +161,9 @@ xiaomi:
   use_command: true                # L05C 必须 true
   mute_xiaoai: false               # 是否屏蔽小爱原生回复（见下方说明）
   trigger_word: ""                 # 触发词，如"问AI"，为空则所有对话都走Agent
+  tts_command: [5, 3]              # L05C TTS action
+  wake_command: [5, 4]
+  debug: false                     # 排查监听时可改为 true
 ```
 
 或在启动前设置环境变量：
@@ -319,6 +322,16 @@ xiaogpt --hardware L05C --account 你的账号 --password 你的密码
 ```
 
 如果 xiaogpt 官方工具能登录成功但本项目失败，请提 issue。
+
+### 监听没有触发
+
+先把 `config.yaml` 里的 `xiaomi.debug` 改成 `true`，重启后观察日志：
+
+- 看到 `[Main] 小米音箱监听启动失败`：登录、验证码、设备 ID 或网络阶段失败。
+- 看到 `[XiaoAi][debug] 已标记 N 条历史对话`：启动时已跳过旧对话，之后的新语音才会触发 Agent。
+- 看到 `[XiaoAi][debug] 暂无新的用户输入`：监听已运行，但小米对话记录里还没有新 query。
+- 看到 `[XiaoAi] 忽略消息(...)`：命中了过滤条件，日志里会写具体原因。
+- 看到 `[XiaoAi] 检测到用户输入` 但没有声音：优先检查 `tts_command`、`miotDID` 和 `use_command`。
 
 ### 其他
 

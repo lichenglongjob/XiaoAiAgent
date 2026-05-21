@@ -16,9 +16,10 @@ xiaomi:
   use_command: true
   mute_xiaoai: false
   trigger_word: ""
-  tts_command: [5, 1]
-  wake_command: [5, 3]
+  tts_command: [5, 3]
+  wake_command: [5, 4]
   polling_interval: 1.0
+  debug: false
 
 # FastAPI 服务配置
 server:

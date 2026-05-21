@@ -34,6 +34,19 @@ _config: AppConfig | None = None
 _speaker_task: asyncio.Task | None = None
 
 
+def _is_configured_value(value: str | None) -> bool:
+    if not value:
+        return False
+    value = value.strip()
+    return not (value.startswith("${") and value.endswith("}"))
+
+
+def _has_xiaomi_credentials(config: AppConfig) -> bool:
+    return _is_configured_value(config.xiaomi.username) and _is_configured_value(
+        config.xiaomi.password
+    )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _agent, _config, _speaker_task
@@ -42,12 +55,18 @@ async def lifespan(app: FastAPI):
     _agent = create_agent(_config, registry)
 
     # 如果配置了小米账号，同时启动音箱监听
-    if _config.xiaomi.username and _config.xiaomi.password:
+    if _has_xiaomi_credentials(_config):
         speaker = XiaoAiSpeakerClient(_config, _agent)
-        _speaker_task = asyncio.create_task(speaker.run())
-        print("[Main] 小米音箱监听已启动")
+        try:
+            await speaker.init()
+        except Exception as exc:
+            print(f"[Main] 小米音箱监听启动失败: {type(exc).__name__}: {exc}")
+            await speaker.close()
+        else:
+            _speaker_task = asyncio.create_task(speaker.run(initialized=True))
+            print("[Main] 小米音箱监听已启动")
     else:
-        print("[Main] 未配置小米账号，仅启动 FastAPI 服务")
+        print("[Main] 未配置有效小米账号，仅启动 FastAPI 服务")
 
     yield
 
@@ -163,7 +182,7 @@ async def _list_xiaomi_devices() -> None:
     from src.xiaomi.miservice import MiAccount, MiNAService
 
     cfg = get_config()
-    if not cfg.xiaomi.username or not cfg.xiaomi.password:
+    if not _has_xiaomi_credentials(cfg):
         print("错误：请先配置小米账号和密码（config.yaml 或环境变量 MI_USER / MI_PASS）")
         return
 

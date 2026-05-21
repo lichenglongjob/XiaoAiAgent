@@ -29,9 +29,10 @@ class XiaomiConfig(BaseModel):
     use_command: bool = True  # L05C/L05B 必须设为 true
     mute_xiaoai: bool = True  # 是否屏蔽小爱原生回复（推荐开启）
     trigger_word: str = ""  # 触发词，为空则所有对话都走 Agent；如填"问AI"则只有包含该词才触发
-    tts_command: list = [5, 1]  # TTS 命令参数
-    wake_command: list = [5, 3]  # 唤醒命令参数
+    tts_command: list = [5, 3]  # TTS 命令参数，L05C 默认为 speak action
+    wake_command: list = [5, 4]  # 唤醒命令参数
     polling_interval: float = 1.0  # 轮询间隔（秒）
+    debug: bool = False  # 输出轮询、过滤、TTS 等详细日志
 
 
 class MCPServerConfig(BaseModel):
@@ -47,6 +48,7 @@ class AppConfig(BaseSettings):
 
     class Config:
         env_prefix = "MYXIAOAI_"
+        env_nested_delimiter = "__"
 
     @property
     def deepseek(self) -> LLMConfig:
