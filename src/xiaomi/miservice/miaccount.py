@@ -1,7 +1,7 @@
 from base64 import b64encode
 from hashlib import md5, sha1
 from json import dumps, loads
-from os import remove, path
+from os import makedirs, path
 from random import sample
 from string import ascii_letters, digits
 from urllib import parse
@@ -24,7 +24,12 @@ class MiTokenStore:
         if path.isfile(self.token_path):
             try:
                 async with aio_open(self.token_path) as f:
-                    return loads(await f.read())
+                    token = loads(await f.read())
+                    _LOGGER.info(
+                        "Loaded Xiaomi token cache from %s (deviceId=%s, sidTokens=%s)",
+                        self.token_path, bool(token.get('deviceId')), len(token.keys() - {'deviceId', 'userId', 'passToken'}),
+                    )
+                    return token
             except Exception as e:
                 _LOGGER.exception("Exception on load token from %s: %s", self.token_path, e)
         return None
@@ -32,17 +37,22 @@ class MiTokenStore:
     async def save_token(self, token=None):
         if token:
             try:
+                parent = path.dirname(self.token_path)
+                if parent:
+                    makedirs(parent, exist_ok=True)
                 async with aio_open(self.token_path, 'w') as f:
                     await f.write(dumps(token, indent=2))
+                _LOGGER.info(
+                    "Saved Xiaomi token cache to %s (deviceId=%s, complete=%s)",
+                    self.token_path, bool(token.get('deviceId')), bool(token.get('userId') and token.get('passToken')),
+                )
             except Exception as e:
                 _LOGGER.exception("Exception on save token to %s: %s", self.token_path, e)
-        elif path.isfile(self.token_path):
-            remove(self.token_path)
 
 
 class MiAccount:
 
-    def __init__(self, session, username, password, token_store='.mi.token'):
+    def __init__(self, session, username, password, token_store='data/.mi.token'):
         self._session = session
         self.username = username
         self.password = password
@@ -69,6 +79,9 @@ class MiAccount:
     async def login(self, sid):
         if not self.token:
             self.token = {'deviceId': get_random(16).upper()}
+            _LOGGER.info("Created Xiaomi deviceId for login")
+        else:
+            _LOGGER.info("Reusing Xiaomi deviceId from token cache")
         try:
             resp = await self._serviceLogin(f'serviceLogin?sid={sid}&_json=true')
             if resp['code'] != 0:
@@ -94,9 +107,33 @@ class MiAccount:
                     else:
                         raise Exception(f'登录失败: {desc} (code={code})')
 
-            print("===== Xiaomi login response =====")
-            print(resp)
-            print("=================================")
+            security_status = resp.get('securityStatus')
+            notification_url = resp.get('notificationUrl')
+            location = resp.get('location')
+            _LOGGER.info(
+                "Xiaomi login response: code=%s securityStatus=%s notificationUrl=%s location=%s",
+                resp.get('code'), security_status, bool(notification_url), bool(location),
+            )
+            if notification_url or security_status:
+                verify_url = parse.urljoin(
+                    'https://account.xiaomi.com', notification_url or '/'
+                )
+                self._last_login_error = (
+                    f'小米账号需要安全验证 (securityStatus: {security_status})。'
+                    f'请在浏览器打开：{verify_url} 完成验证后，请重新运行程序。'
+                )
+                print('小米账号需要安全验证')
+                print(f'securityStatus: {security_status}')
+                print(f'请在浏览器打开：{verify_url}')
+                print('完成验证后，请重新运行程序。')
+                if self.token_store:
+                    await self.token_store.save_token(self.token)
+                return False
+
+            required = ('userId', 'passToken', 'location', 'nonce', 'ssecurity')
+            missing = [key for key in required if not resp.get(key)]
+            if missing:
+                raise Exception(f'登录响应缺少必要字段: {", ".join(missing)}')
             self.token['userId'] = resp['userId']
             self.token['passToken'] = resp['passToken']
 
@@ -107,10 +144,10 @@ class MiAccount:
             return True
 
         except Exception as e:
-            self.token = None
             self._last_login_error = str(e)
             if self.token_store:
-                await self.token_store.save_token()
+                # Keep deviceId so the next attempt is recognized as the same device.
+                await self.token_store.save_token(self.token)
             _LOGGER.exception("Exception on login %s: %s", self.username, e)
             return False
 
@@ -155,9 +192,9 @@ class MiAccount:
                     resp = await r.text()
                 if status == 401 and relogin:
                     _LOGGER.warning("Auth error on request %s %s, relogin...", url, resp)
-                    self.token = None
+                    self.token = {'deviceId': self.token.get('deviceId')} if self.token else None
                     if self.token_store:
-                        await self.token_store.save_token()
+                        await self.token_store.save_token(self.token)
                     return await self.mi_request(sid, url, data, headers, False)
         else:
             err = self._last_login_error or "Login failed"
