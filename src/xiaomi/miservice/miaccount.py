@@ -94,6 +94,9 @@ class MiAccount:
                     else:
                         raise Exception(f'登录失败: {desc} (code={code})')
 
+            print("===== Xiaomi login response =====")
+            print(resp)
+            print("=================================")
             self.token['userId'] = resp['userId']
             self.token['passToken'] = resp['passToken']
 
